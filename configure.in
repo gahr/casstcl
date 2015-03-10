@@ -185,4 +185,6 @@ TEA_PROG_TCLSH
 # which require substituting th AC variables in.  Include these here.
 #--------------------------------------------------------------------
 
+CASSTCL_MAKE_PGTCL
+
 AC_OUTPUT([Makefile pkgIndex.tcl])

@@ -12,6 +12,8 @@
 #include <string.h>
 #include <cassandra.h>
 
+#include <libpq-fe.h>
+
 #define CASS_SESSION_MAGIC 7138570
 #define CASS_FUTURE_MAGIC 71077345
 #define CASS_BATCH_MAGIC 14215469
