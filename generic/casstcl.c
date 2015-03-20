@@ -4044,6 +4044,7 @@ casstcl_import_from_pg_select (casstcl_sessionClientData *ct, char *tableName, i
 	int nRowsReturned = 0;
 	Tcl_Obj *batchObj = NULL;
 	casstcl_batchClientData *bcd = NULL;
+			Tcl_Obj *listObj = NULL;
 
 	conn = PgGetConnectionId (interp, connString, &connid);
 	if (conn == NULL) {
@@ -4081,6 +4082,7 @@ casstcl_import_from_pg_select (casstcl_sessionClientData *ct, char *tableName, i
 
 			for (column = 0; column < ncols; column++) {
 				columnNameObjs[column] = Tcl_NewStringObj (PQfname (result, column), -1);
+				Tcl_IncrRefCount (columnNameObjs[column]);
 			}
 
 			// there is at least one result.  create the first and possibly
@@ -4094,7 +4096,10 @@ casstcl_import_from_pg_select (casstcl_sessionClientData *ct, char *tableName, i
 		// loop is likely to run many times and, thus, this...
 		//
 		for (tupno = 0; tupno < PQntuples (result); tupno++) {
-			Tcl_Obj *listObj = Tcl_NewObj ();
+			if (listObj != NULL) {
+				Tcl_DecrRefCount (listObj);
+			}
+			listObj = Tcl_NewObj ();
 
 			nRowsReturned++;
 
@@ -4164,6 +4169,11 @@ casstcl_import_from_pg_select (casstcl_sessionClientData *ct, char *tableName, i
 	}
 
 	if (columnNameObjs != NULL) {
+		int column;
+
+		for (column = 0; column < ncols; column++) {
+			Tcl_DecrRefCount (columnNameObjs[column]);
+		}
 		ckfree ((void *)columnNameObjs);
 	}
 
