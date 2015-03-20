@@ -20,6 +20,11 @@
 #include <sys/types.h>
 #include <cassandra.h>
 
+#ifdef WITH_PGTCL
+#include "/home/karl/src/Pgtcl/generic/pgtclCmds.h"
+#include "/home/karl/src/Pgtcl/generic/pgtclId.h"
+#endif
+
 #include <libpq-fe.h>
 
 #define CASS_SESSION_MAGIC 7138570

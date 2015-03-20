@@ -6,6 +6,8 @@
  * freely redistributable under the Berkeley license
  */
 
+#define WITH_PGTCL
+
 #include "casstcl.h"
 #include <assert.h>
 
@@ -3429,118 +3431,6 @@ casstcl_make_statement_from_objv (casstcl_sessionClientData *ct, int objc, Tcl_O
 	}
 }
 
-int
-casstcl_select_from_pg (casstcl_sessionClientData *ct, char *tableName, int batchSize, Tcl_Obj *calloutObj, Tcl_Obj *connObj, char *queryString)
-{
-	Tcl_Interp *interp = ct->interp;
-	Pgh_ConnectionId *connid;
-	PGconn *conn;
-	char *connString = Tcl_GetString (connObj);
-	PGresult *result;
-	int ncols;
-	casstcl_batchClientData *bcd = casstcl_batch_command_to_batchClientData (ct, batchObjName);
-	int tclReturn = TCL_OK;
-	Tcl_Obj **columnNameObjs = NULL;
-	int nRowsReturned = 0;
-
-	conn = PgGetConnectionId (interp, connString, &connid);
-	if (conn == NULL) {
-		return TCL_ERROR;
-	}
-
-	if (PQsendQuery (conn, queryString) == 0) {
-		Tcl_SetObjResult (interp, Tcl_NewStringObj (PQerrorMessage(conn), -1));
-		return TCL_ERROR;
-	}
-
-	PQsetSingleRowMode (conn);
-
-	while ((result = PQgetResult (conn)) != NULL) {
-		int resultStatus = PQresultStatus (result);
-		int tupno;
-		int column;
-
-		if (resultStatus != PGRES_TUPLES_OK && resultStatus != PGRES_SINGLE_TUPLE) {
-			char *errString = PQresultErrorMessage (result);
-
-			if (*errString == '\0') {
-				errString = PQresStatus (resultStatus);
-			}
-			Tcl_SetObjResult (interp, errString, -1);
-			return TCL_ERROR;
-		}
-
-		// on the first pass squirrel off the column names
-		if (nRowsReturned++ == 0) {
-			ncols = PQnfields (result);
-			int column;
-
-			columnNameObjs = (Tcl_Obj **)ckalloc (sizeof (Tcl_Obj *) * ncols);
-
-			for (column = 0; column < ncols; column++) {
-				columnNameObjs[column] = Tcl_NewStringObj (PQfname (result, column), -1);
-			}
-
-			firstPass = 0;
-		}
-
-		// handle result, since we are doing single row mode then the outer
-		// loop is likely to run many times and, thus, this...
-		//
-		for (tupno = 0; tupno < PQntuples (result); tupno++) {
-			Tcl_Obj *listObj = Tcl_NewObj ();
-
-			for (column = 0; column < ncols; column++) {
-				char *string;
-
-				if (PQgetisnull (result, tupno, column)) {
-					continue;
-				}
-
-				string = PQgetvalue (result, tupno, column);
-
-				if (Tcl_ListObjAppendElement (interp, listObj, columnNameObjs[column]) == TCL_ERROR) {
-					Tcl_AppendResult (interp, " while appending field name '", Tcl_GetString (columnNameObjs[column]), "'", NULL);
-					return TCL_ERROR;
-				}
-
-				if (Tcl_ListObjAppendElement (interp, listObj, string) == TCL_ERROR) {
-					Tcl_AppendResult (interp, " while appending field value '", string, "'", NULL);
-					return TCL_ERROR;
-				}
-			}
-
-			CassStatement *statement;
-			tclReturn = casstcl_make_upsert_statement (ct, tableName, listObj, &statement);
-			if (tclReturn != TCL_ERROR) {
-				CassError cassError;
-				cassError = cass_batch_add_statement (bcd->batch, statement);
-				cass_statement_free (statement);
-
-				if (cassError == CASS_OK) {
-					if (bcd->count++ >= batchSize) {
-						tclReturn = casstcl_invoke_callback_with_argument (interp, callbackObj, futureObj);
-					}
-				} else {
-					return casstcl_cass_error_to_tcl (bcd->ct, cassError);
-				}
-			}
-		}
-		PQclear (result);
-	}
-
-	done:
-	// drain output
-	while ((result = PQgetResult (conn)) != NULL) {
-		PQclear (result);
-	}
-
-	if (columnNameObjs != NULL) {
-		ckfree ((void *)columnNameObjs);
-	}
-	return tclReturn;
-}
-
 /*
  *----------------------------------------------------------------------
  *
@@ -4128,6 +4018,165 @@ casstcl_createBatchObjectCommand (casstcl_sessionClientData *ct, char *commandNa
 /*
  *----------------------------------------------------------------------
  *
+ * casstcl_select_from_pg --
+ *
+ *    perform a postgres select, create batches from returned rows
+ *    and call out to a callout routine with a batch object argument
+ *    every batchSize rows returned
+ *
+ * Results:
+ *    A standard Tcl result
+ *
+ *----------------------------------------------------------------------
+ */
+int
+casstcl_select_from_pg (casstcl_sessionClientData *ct, char *tableName, int batchSize, Tcl_Obj *calloutObj, Tcl_Obj *connObj, char *queryString)
+{
+	Tcl_Interp *interp = ct->interp;
+#ifdef WITH_PGTCL
+	Pg_ConnectionId *connid;
+	PGconn *conn;
+	char *connString = Tcl_GetString (connObj);
+	PGresult *result;
+	int ncols;
+	int tclReturn = TCL_OK;
+	Tcl_Obj **columnNameObjs = NULL;
+	int nRowsReturned = 0;
+	Tcl_Obj *batchObj = NULL;
+	casstcl_batchClientData *bcd = NULL;
+
+	conn = PgGetConnectionId (interp, connString, &connid);
+	if (conn == NULL) {
+		return TCL_ERROR;
+	}
+
+	if (PQsendQuery (conn, queryString) == 0) {
+		Tcl_SetObjResult (interp, Tcl_NewStringObj (PQerrorMessage(conn), -1));
+		return TCL_ERROR;
+	}
+
+	PQsetSingleRowMode (conn);
+
+	while ((result = PQgetResult (conn)) != NULL) {
+		int resultStatus = PQresultStatus (result);
+		int tupno;
+		int column;
+
+		if (resultStatus != PGRES_TUPLES_OK && resultStatus != PGRES_SINGLE_TUPLE) {
+			char *errString = PQresultErrorMessage (result);
+
+			if (*errString == '\0') {
+				errString = PQresStatus (resultStatus);
+			}
+			Tcl_SetObjResult (interp, Tcl_NewStringObj (errString, -1));
+			return TCL_ERROR;
+		}
+
+		// on the first pass squirrel off the column names
+		if (nRowsReturned++ == 0) {
+			ncols = PQnfields (result);
+			int column;
+
+			columnNameObjs = (Tcl_Obj **)ckalloc (sizeof (Tcl_Obj *) * ncols);
+
+			for (column = 0; column < ncols; column++) {
+				columnNameObjs[column] = Tcl_NewStringObj (PQfname (result, column), -1);
+			}
+
+			// there is at least one result.  create the first and possibly
+			// the only batch object that we will accumulate results into
+			casstcl_createBatchObjectCommand (ct, "#auto", CASS_BATCH_TYPE_LOGGED);
+			batchObj = Tcl_GetObjResult (interp);
+			bcd = casstcl_batch_command_to_batchClientData (ct, Tcl_GetString(batchObj));
+		}
+
+		// handle result, since we are doing single row mode then the outer
+		// loop is likely to run many times and, thus, this...
+		//
+		for (tupno = 0; tupno < PQntuples (result); tupno++) {
+			Tcl_Obj *listObj = Tcl_NewObj ();
+
+			for (column = 0; column < ncols; column++) {
+				char *string;
+
+				if (PQgetisnull (result, tupno, column)) {
+					continue;
+				}
+
+				string = PQgetvalue (result, tupno, column);
+
+				if (Tcl_ListObjAppendElement (interp, listObj, columnNameObjs[column]) == TCL_ERROR) {
+					Tcl_AppendResult (interp, " while appending field name '", Tcl_GetString (columnNameObjs[column]), "'", NULL);
+					return TCL_ERROR;
+				}
+
+				if (Tcl_ListObjAppendElement (interp, listObj, Tcl_NewStringObj (string, -1)) == TCL_ERROR) {
+					Tcl_AppendResult (interp, " while appending field value '", string, "'", NULL);
+					return TCL_ERROR;
+				}
+			}
+
+			CassStatement *statement;
+			tclReturn = casstcl_make_upsert_statement (ct, tableName, listObj, &statement);
+			if (tclReturn != TCL_ERROR) {
+				CassError cassError;
+				cassError = cass_batch_add_statement (bcd->batch, statement);
+				cass_statement_free (statement);
+
+				if (cassError == CASS_OK) {
+					//
+					// if we've reached the size limit, invoke the
+					// callout with the batch object as the argument
+					// and then create a new batch object
+					//
+					// it is up to the callout routine to dispose of the batch
+					//
+					if (bcd->count++ >= batchSize) {
+						tclReturn = casstcl_invoke_callback_with_argument (interp, calloutObj, batchObj);
+
+						if (tclReturn == TCL_OK) {
+							casstcl_createBatchObjectCommand (ct, "#auto", CASS_BATCH_TYPE_LOGGED);
+							batchObj = Tcl_GetObjResult (interp);
+							bcd = casstcl_batch_command_to_batchClientData (ct, Tcl_GetString(batchObj));
+						}
+					}
+				} else {
+					return casstcl_cass_error_to_tcl (bcd->ct, cassError);
+				}
+			}
+		}
+		PQclear (result);
+	}
+
+	// if there are rows in the current batch, invoke the callout
+	// it is up to the callout routine to dispose of the batch
+	if (bcd->count > 0) {
+		tclReturn = casstcl_invoke_callback_with_argument (interp, calloutObj, batchObj);
+	}
+
+	// drain output
+	while ((result = PQgetResult (conn)) != NULL) {
+		PQclear (result);
+	}
+
+	if (columnNameObjs != NULL) {
+		ckfree ((void *)columnNameObjs);
+	}
+
+	if (tclReturn == TCL_OK) {
+		Tcl_SetObjResult (interp, Tcl_NewIntObj (nRowsReturned));
+	}
+
+	return tclReturn;
+#else
+	Tcl_AppendResult (interp, "this version of casstcl was not built with PostgreSQL support", NULL);
+	return TCL_ERROR;
+#endif
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
  * casstcl_preparedObjectObjCmd --
  *
  *    dispatches the subcommands of a casstcl prepared statement-handling
@@ -4466,6 +4515,7 @@ casstcl_cassObjectObjCmd(ClientData cData, Tcl_Interp *interp, int objc, Tcl_Obj
 		"ssl_cert",
 		"ssl_private_key",
 		"ssl_verify_flag",
+		"import_from_pg_select",
 		"delete",
 		"close",
         NULL
@@ -4505,6 +4555,7 @@ casstcl_cassObjectObjCmd(ClientData cData, Tcl_Interp *interp, int objc, Tcl_Obj
 		OPT_SSL_CERT,
 		OPT_SSL_PRIVATE_KEY,
 		OPT_SSL_VERIFY_FLAG,
+		OPT_IMPORT_FROM_PG_SELECT,
 		OPT_DELETE,
 		OPT_CLOSE
     };
@@ -4806,6 +4857,29 @@ casstcl_cassObjectObjCmd(ClientData cData, Tcl_Interp *interp, int objc, Tcl_Obj
 			}
 
 			return casstcl_createBatchObjectCommand (ct, Tcl_GetString (objv[2]), cassBatchType);
+		}
+
+		case OPT_IMPORT_FROM_PG_SELECT: {
+
+			if (objc != 7) {
+				Tcl_WrongNumArgs (interp, 1, objv, "tableName batchSize calloutRoutine pgtcl_connectionHandle query");
+				return TCL_ERROR;
+			}
+
+			char *tableName = Tcl_GetString (objv[2]);
+			int batchSize;
+
+			if (Tcl_GetIntFromObj (interp, objv[3], &batchSize) == TCL_ERROR) {
+				Tcl_AppendResult (interp, " while reading batchSize element", NULL);
+				return TCL_ERROR;
+			}
+
+			Tcl_Obj *calloutRoutine = objv[4];
+			Tcl_Obj *pgtclHandle = objv[5];
+			char *queryString = Tcl_GetString (objv[6]);
+
+
+			return casstcl_select_from_pg (ct, tableName, batchSize, calloutRoutine, pgtclHandle, queryString);
 		}
 
 		case OPT_LIST_KEYSPACES: {
