@@ -4073,7 +4073,7 @@ casstcl_import_from_pg_select (casstcl_sessionClientData *ct, char *tableName, i
 		}
 
 		// on the first pass squirrel off the column names
-		if (nRowsReturned++ == 0) {
+		if (nRowsReturned == 0) {
 			ncols = PQnfields (result);
 			int column;
 
@@ -4095,6 +4095,8 @@ casstcl_import_from_pg_select (casstcl_sessionClientData *ct, char *tableName, i
 		//
 		for (tupno = 0; tupno < PQntuples (result); tupno++) {
 			Tcl_Obj *listObj = Tcl_NewObj ();
+
+			nRowsReturned++;
 
 			for (column = 0; column < ncols; column++) {
 				char *string;
