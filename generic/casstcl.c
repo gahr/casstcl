@@ -4018,7 +4018,7 @@ casstcl_createBatchObjectCommand (casstcl_sessionClientData *ct, char *commandNa
 /*
  *----------------------------------------------------------------------
  *
- * casstcl_select_from_pg --
+ * casstcl_import_from_pg_select --
  *
  *    perform a postgres select, create batches from returned rows
  *    and call out to a callout routine with a batch object argument
@@ -4030,7 +4030,7 @@ casstcl_createBatchObjectCommand (casstcl_sessionClientData *ct, char *commandNa
  *----------------------------------------------------------------------
  */
 int
-casstcl_select_from_pg (casstcl_sessionClientData *ct, char *tableName, int batchSize, Tcl_Obj *calloutObj, Tcl_Obj *connObj, char *queryString)
+casstcl_import_from_pg_select (casstcl_sessionClientData *ct, char *tableName, int batchSize, Tcl_Obj *calloutObj, Tcl_Obj *connObj, char *queryString)
 {
 	Tcl_Interp *interp = ct->interp;
 #ifdef WITH_PGTCL
@@ -4134,11 +4134,13 @@ casstcl_select_from_pg (casstcl_sessionClientData *ct, char *tableName, int batc
 					if (bcd->count++ >= batchSize) {
 						tclReturn = casstcl_invoke_callback_with_argument (interp, calloutObj, batchObj);
 
-						if (tclReturn == TCL_OK) {
-							casstcl_createBatchObjectCommand (ct, "#auto", CASS_BATCH_TYPE_LOGGED);
-							batchObj = Tcl_GetObjResult (interp);
-							bcd = casstcl_batch_command_to_batchClientData (ct, Tcl_GetString(batchObj));
+						if (tclReturn == TCL_ERROR) {
+							break;
 						}
+						Tcl_ResetResult (interp);
+						casstcl_createBatchObjectCommand (ct, "#auto", CASS_BATCH_TYPE_LOGGED);
+						batchObj = Tcl_GetObjResult (interp);
+						bcd = casstcl_batch_command_to_batchClientData (ct, Tcl_GetString(batchObj));
 					}
 				} else {
 					return casstcl_cass_error_to_tcl (bcd->ct, cassError);
@@ -4879,7 +4881,7 @@ casstcl_cassObjectObjCmd(ClientData cData, Tcl_Interp *interp, int objc, Tcl_Obj
 			char *queryString = Tcl_GetString (objv[6]);
 
 
-			return casstcl_select_from_pg (ct, tableName, batchSize, calloutRoutine, pgtclHandle, queryString);
+			return casstcl_import_from_pg_select (ct, tableName, batchSize, calloutRoutine, pgtclHandle, queryString);
 		}
 
 		case OPT_LIST_KEYSPACES: {
