@@ -294,7 +294,7 @@ const char *casstcl_cass_error_to_errorcode_string (CassError cassError)
  *--------------------------------------------------------------
  */
 int
-casstcl_obj_to_cass_log_level (casstcl_sessionClientData *ct, Tcl_Obj *tclObj, CassLogLevel *cassLogLevel) {
+casstcl_obj_to_cass_log_level (Tcl_Interp *interp, Tcl_Obj *tclObj, CassLogLevel *cassLogLevel) {
     int                 logIndex;
 
     static CONST char *logLevels[] = {
@@ -319,7 +319,7 @@ casstcl_obj_to_cass_log_level (casstcl_sessionClientData *ct, Tcl_Obj *tclObj, C
 	};
 
     // argument must be one of the options defined above
-    if (Tcl_GetIndexFromObj (ct->interp, tclObj, logLevels, "logLevel",
+    if (Tcl_GetIndexFromObj (interp, tclObj, logLevels, "logLevel",
         TCL_EXACT, &logIndex) != TCL_OK) {
         return TCL_ERROR;
     }
@@ -1126,7 +1126,6 @@ casstcl_list_columns (casstcl_sessionClientData *ct, char *keyspace, char *table
 
 				elementObj = Tcl_GetObjResult (interp);
 				Tcl_IncrRefCount(elementObj);
-				// Tcl_ResetResult (interp);
 			}
 
 			// we got here, either we found elementObj by looking it up
@@ -1469,6 +1468,376 @@ void casstcl_logging_callback (const CassLogMessage *message, void *data) {
 /*
  *----------------------------------------------------------------------
  *
+ * casstcl_InitCassBytesFromBignum --
+ *
+ *	Allocate and initialize a CassBytes from a 'bignum'.
+ *
+ * Results:
+ *	A standard Tcl result.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
+
+int
+casstcl_InitCassBytesFromBignum(
+    Tcl_Interp *interp,		/* Used for error reporting if not NULL. */
+    CassBytes *v,		/* CassBytes to initialize */
+    mp_int *a)			/* Initial value */
+{
+    unsigned char *data;
+    unsigned long outlen;
+    int status;
+
+    outlen = TclBN_mp_unsigned_bin_size(a);
+    data = (cass_byte_t *) ckalloc(outlen);
+
+    status = TclBN_mp_to_unsigned_bin_n(a, data, &outlen);
+
+    if (status != MP_OKAY) {
+	if (interp != NULL) {
+	    Tcl_ResetResult(interp);
+	    Tcl_AppendResult(interp, "could not init bytes", NULL);
+	}
+	ckfree(data);
+	return TCL_ERROR;
+    }
+
+    v->data = data;
+    v->size = outlen;
+    return TCL_OK;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * casstcl_GetTimestampFromObj --
+ *
+ *	Accepts a Tcl object value that specifies a whole number of
+ *	seconds and optionally a fractional number of seconds, and
+ *	converts the value to the whole number of milliseconds.
+ *
+ * Results:
+ *	A standard Tcl result.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
+
+int
+casstcl_GetTimestampFromObj(
+    Tcl_Interp *interp,		/* Used for error reporting if not NULL. */
+    Tcl_Obj *objPtr,		/* Object from which to get milliseconds. */
+    cass_int64_t *milliseconds)	/* Place to store whole milliseconds. */
+{
+  Tcl_WideInt wideVal;
+  if (Tcl_GetWideIntFromObj(NULL, objPtr, &wideVal) == TCL_OK) {
+    if (wideVal < CASS_TIMESTAMP_LOWER_LIMIT ||
+            wideVal > CASS_TIMESTAMP_UPPER_LIMIT) {
+      if (interp != NULL) {
+        Tcl_ResetResult(interp);
+        Tcl_AppendResult(interp, "whole seconds cannot exceed ",
+            STRINGIFY(CASS_TIMESTAMP_UPPER_LIMIT), NULL);
+      }
+      return TCL_ERROR;
+    } else {
+      *milliseconds = wideVal * 1000; /* SAFE: See 'if' above. */
+    }
+  } else {
+    double doubleVal;
+    if (Tcl_GetDoubleFromObj(interp, objPtr, &doubleVal) == TCL_OK) {
+      if ((Tcl_WideInt)doubleVal < CASS_TIMESTAMP_LOWER_LIMIT ||
+              (Tcl_WideInt)doubleVal > CASS_TIMESTAMP_UPPER_LIMIT) {
+        if (interp != NULL) {
+          Tcl_ResetResult(interp);
+          Tcl_AppendResult(interp, "whole seconds cannot exceed ",
+              STRINGIFY(CASS_TIMESTAMP_UPPER_LIMIT), NULL);
+        }
+        return TCL_ERROR;
+      } else {
+        wideVal = (Tcl_WideInt)doubleVal; /* SAFE: See 'if' above. */
+        doubleVal -= (double)wideVal;
+        doubleVal *= 1000.0;
+        *milliseconds = (wideVal * 1000) + (Tcl_WideInt)doubleVal;
+      }
+    } else {
+      return TCL_ERROR;
+    }
+  }
+  return TCL_OK;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * casstcl_NewTimestampObj --
+ *
+ *	Accepts a Cassandra 'timestamp' value, in milliseconds, and
+ *	creates a Tcl object based on it.  If the milliseconds is
+ *	evenly divisible by 1000, a Tcl wide integer object will be
+ *	returned, containing the exact number of seconds.  Otherwise,
+ *	a Tcl double object will be returned with an approximate value,
+ *	where the fractional portion of the double will represent the
+ *	milliseconds and the whole portion will represent the number
+ *	of seconds.
+ *
+ * Results:
+ *	The newly created Tcl object, having a reference count of zero.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
+
+Tcl_Obj *casstcl_NewTimestampObj(
+  cass_int64_t milliseconds
+){
+  if((milliseconds % 1000) == 0) {
+    return Tcl_NewWideIntObj(milliseconds / 1000);
+  } else {
+    return Tcl_NewDoubleObj((double)milliseconds / 1000.0);
+  }
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * mp_read_unsigned_bin --
+ *
+ *	Read a binary encoded 'bignum' from the specified buffer.  It
+ *	must have been initialized first.  This routine was borrowed
+ *	directly from the Tcl 8.6 source code (i.e. because we needed
+ *	it and it was not available as an export).
+ *
+ * Results:
+ *	A standard LibTomMath result.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
+
+int mp_read_unsigned_bin (mp_int * a, const unsigned char *b, int c)
+{
+  int     res;
+
+  /* make sure there are at least two digits */
+  if (a->alloc < 2) {
+     if ((res = TclBN_mp_grow(a, 2)) != MP_OKAY) {
+        return res;
+     }
+  }
+
+  /* zero the int */
+  TclBN_mp_zero (a);
+
+  /* read the bytes in */
+  while (c-- > 0) {
+    if ((res = TclBN_mp_mul_2d (a, 8, a)) != MP_OKAY) {
+      return res;
+    }
+
+#ifndef MP_8BIT
+      a->dp[0] |= *b++;
+      a->used += 1;
+#else
+      a->dp[0] = (*b & MP_MASK);
+      a->dp[1] |= ((*b++ >> 7U) & 1);
+      a->used += 2;
+#endif
+  }
+  TclBN_mp_clamp (a);
+  return MP_OKAY;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * casstcl_InitBignumFromCassBytes --
+ *
+ *	Allocate and initialize a 'bignum' from a CassBytes.
+ *
+ * Results:
+*	A standard Tcl result.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
+
+int
+casstcl_InitBignumFromCassBytes(
+    Tcl_Interp *interp,		/* Used for error reporting if not NULL. */
+    mp_int *a,			/* Bignum to initialize */
+    CassBytes *v)		/* Initial value */
+{
+    int status = TclBN_mp_init(a);
+
+    if (status != MP_OKAY) {
+	if (interp != NULL) {
+	    Tcl_ResetResult(interp);
+	    Tcl_AppendResult(interp, "could not init bignum", NULL);
+	}
+	return TCL_ERROR;
+    }
+
+    status = mp_read_unsigned_bin(a, v->data, v->size);
+
+    if (status != MP_OKAY) {
+	if (interp != NULL) {
+	    Tcl_ResetResult(interp);
+	    Tcl_AppendResult(interp, "could not read bignum", NULL);
+	}
+	return TCL_ERROR;
+    }
+
+    return TCL_OK;
+}
+
+#if 0
+/*
+ *----------------------------------------------------------------------
+ *
+ * casstcl_DumpAddrInfo --
+ *
+ *	Attempts to dump the contents of the struct addrinfo.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
+
+void casstcl_DumpAddrInfo(
+  FILE *pFile,
+  struct addrinfo *pAddrInfo,
+  int indent
+){
+  int index;
+  uint8_t *pAddress = NULL;
+  if( !pAddrInfo ) return;
+  if( indent>0 ) fprintf(pFile, "\n");
+  fprintf(pFile, "%*s", indent * 2, "");
+  fprintf(pFile, "pAddrInfo = [%p\n", pAddrInfo);
+  fprintf(pFile, "%*s", indent * 2, "");
+  fprintf(pFile, "  ->flags = %d\n", pAddrInfo->ai_flags);
+  fprintf(pFile, "%*s", indent * 2, "");
+  fprintf(pFile, "  ->family = %d\n", pAddrInfo->ai_family);
+  fprintf(pFile, "%*s", indent * 2, "");
+  fprintf(pFile, "  ->socktype = %d\n", pAddrInfo->ai_socktype);
+  fprintf(pFile, "%*s", indent * 2, "");
+  fprintf(pFile, "  ->protocol = %d\n", pAddrInfo->ai_protocol);
+  fprintf(pFile, "%*s", indent * 2, "");
+  fprintf(pFile, "  ->addrlen = %d\n", (int)pAddrInfo->ai_addrlen);
+  fprintf(pFile, "%*s", indent * 2, "");
+  fprintf(pFile, "  ->addr = [");
+  if(pAddrInfo->ai_family == AF_INET){
+    struct sockaddr_in *pSockAddr = (struct sockaddr_in *)pAddrInfo->ai_addr;
+    pAddress = (uint8_t *)&pSockAddr->sin_addr.s_addr;
+    fprintf(pFile, "IPv4 [");
+  }else if(pAddrInfo->ai_family == AF_INET6){
+    struct sockaddr_in6 *pSockAddr = (struct sockaddr_in6 *)pAddrInfo->ai_addr;
+    pAddress = (uint8_t *)&pSockAddr->sin6_addr.s6_addr;
+    fprintf(pFile, "IPv6 [");
+  }else{
+    fprintf(pFile, "<not_ipv4_or_ipv6>");
+  }
+  if( pAddress ){
+    for (index=0; index<pAddrInfo->ai_addrlen; index++) {
+      if( index>0 ){
+        fprintf(pFile, ", ");
+      }
+      fprintf(pFile, "%d", (int)(pAddress[index]));
+    }
+  }
+  fprintf(pFile, "]]\n");
+  fprintf(pFile, "%*s", indent * 2, "");
+  fprintf(pFile, "  ->canonname = \"%s\"\n", pAddrInfo->ai_canonname);
+  fprintf(pFile, "%*s", indent * 2, "");
+  fprintf(pFile, "  ->next = [%p]\n", pAddrInfo->ai_next);
+  casstcl_DumpAddrInfo(pFile, pAddrInfo->ai_next, indent + 1);
+  fprintf(pFile, "%*s", indent * 2, "");
+  fprintf(pFile, "]\n");
+}
+#endif
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * casstcl_GetInetFromObj --
+ *
+ *	Attempt to return an Inet from the Tcl object "objPtr".
+ *
+ * Results:
+ *	A standard Tcl result.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
+
+int
+casstcl_GetInetFromObj(
+    Tcl_Interp *interp,	/* Used for error reporting if not NULL. */
+    Tcl_Obj *objPtr,	/* The object from which to get an Inet. */
+    CassInet *inetPtr)	/* Place to store resulting Inet. */
+{
+	const char *value = Tcl_GetString(objPtr);
+	struct addrinfo hints;
+	struct addrinfo *result = NULL;
+	int rc;
+
+	memset(&hints, 0, sizeof(struct addrinfo));
+	hints.ai_flags = AI_NUMERICHOST;
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	rc = getaddrinfo(value, NULL, &hints, &result);
+
+	if (rc == 0) {
+#if 0
+		casstcl_DumpAddrInfo(stdout, result, 0);
+#endif
+		assert(result != NULL);
+		assert(result->ai_addrlen >= 0);
+		assert(result->ai_addrlen <= CASS_INET_V6_LENGTH);
+		memset(inetPtr, 0, sizeof(CassInet));
+		if (result->ai_family == AF_INET) {
+			struct sockaddr_in *pSockAddr = (struct sockaddr_in *)result->ai_addr;
+			*inetPtr = cass_inet_init_v4((const cass_uint8_t *)&pSockAddr->sin_addr.s_addr);
+			freeaddrinfo(result);
+			return TCL_OK;
+		} else if (result->ai_family == AF_INET6) {
+			struct sockaddr_in6 *pSockAddr = (struct sockaddr_in6 *)result->ai_addr;
+			*inetPtr = cass_inet_init_v6((const cass_uint8_t *)&pSockAddr->sin6_addr.s6_addr);
+			freeaddrinfo(result);
+			return TCL_OK;
+		} else {
+			Tcl_ResetResult(interp);
+			Tcl_AppendResult(interp, "address \"", value, "\" is not IPv4 or IPv6", NULL);
+			freeaddrinfo(result);
+			return TCL_ERROR;
+		}
+	} else {
+		Tcl_ResetResult(interp);
+		Tcl_AppendResult(interp, gai_strerror(rc), NULL);
+		return TCL_ERROR;
+	}
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
  * casstcl_cass_value_to_tcl_obj --
  *
  *      Given a cassandra CassValue, generate a Tcl_Obj of a corresponding
@@ -1485,19 +1854,26 @@ void casstcl_logging_callback (const CassLogMessage *message, void *data) {
 
 int casstcl_cass_value_to_tcl_obj (casstcl_sessionClientData *ct, const CassValue *cassValue, Tcl_Obj **tclObj)
 {
+	char msg[60];
 	CassValueType valueType = cass_value_type (cassValue);
 	Tcl_Interp *interp = ct->interp;
 
 	switch (valueType) {
 
 		case CASS_VALUE_TYPE_UNKNOWN: {
+			Tcl_ResetResult(interp);
+			Tcl_AppendResult(interp, "unsupported value type for get operation 'unknown'", NULL);
+
 			*tclObj = NULL;
-			return TCL_OK;
+			return TCL_ERROR;
 		}
 
 		case CASS_VALUE_TYPE_CUSTOM: {
+			Tcl_ResetResult(interp);
+			Tcl_AppendResult(interp, "unsupported value type for get operation 'custom'", NULL);
+
 			*tclObj = NULL;
-			return TCL_OK;
+			return TCL_ERROR;
 		}
 
 		case CASS_VALUE_TYPE_ASCII:
@@ -1510,7 +1886,20 @@ int casstcl_cass_value_to_tcl_obj (casstcl_sessionClientData *ct, const CassValu
 			return TCL_OK;
 		}
 
-		case CASS_VALUE_TYPE_TIMESTAMP:
+		case CASS_VALUE_TYPE_TIMESTAMP: {
+			cass_int64_t cassInt;
+			CassError cassError;
+
+			cassError = cass_value_get_int64 (cassValue, &cassInt);
+
+			if (cassError != CASS_OK) {
+				return casstcl_cass_error_to_tcl (ct, cassError);
+			}
+
+			*tclObj = casstcl_NewTimestampObj (cassInt);
+			return TCL_OK;
+		}
+
 		case CASS_VALUE_TYPE_COUNTER:
 		case CASS_VALUE_TYPE_BIGINT: {
 			cass_int64_t cassInt;
@@ -1549,7 +1938,25 @@ int casstcl_cass_value_to_tcl_obj (casstcl_sessionClientData *ct, const CassValu
 		}
 
 		case CASS_VALUE_TYPE_DECIMAL: {
-			*tclObj = NULL;
+			mp_int mpVal;
+			CassDecimal cassDecimal;
+			CassError cassError;
+			Tcl_Obj *listObjv[2];
+
+			cassError = cass_value_get_decimal(cassValue, &cassDecimal);
+
+			if (cassError != CASS_OK) {
+				return casstcl_cass_error_to_tcl (ct, cassError);
+			}
+
+			if (casstcl_InitBignumFromCassBytes(interp, &mpVal, &cassDecimal.varint) != TCL_OK) {
+				return TCL_ERROR;
+			}
+
+			listObjv[0] = Tcl_NewIntObj(cassDecimal.scale);
+			listObjv[1] = Tcl_NewBignumObj(&mpVal);
+
+			*tclObj = Tcl_NewListObj(2, listObjv);
 			return TCL_OK;
 		}
 
@@ -1595,32 +2002,50 @@ int casstcl_cass_value_to_tcl_obj (casstcl_sessionClientData *ct, const CassValu
 			return TCL_OK;
 		}
 
-		case CASS_VALUE_TYPE_UUID: {
+		case CASS_VALUE_TYPE_UUID:
+		case CASS_VALUE_TYPE_TIMEUUID: {
 			CassUuid key;
+			CassError cassError;
 			char key_str[CASS_UUID_STRING_LENGTH];
 
-			cass_value_get_uuid(cassValue, &key);
+			cassError = cass_value_get_uuid(cassValue, &key);
+
+			if (cassError != CASS_OK) {
+				return casstcl_cass_error_to_tcl (ct, cassError);
+			}
+
 			cass_uuid_string(key, key_str);
-			*tclObj = Tcl_NewStringObj (key_str, CASS_UUID_STRING_LENGTH);
+			*tclObj = Tcl_NewStringObj (key_str, CASS_UUID_STRING_LENGTH - 1);
 			return TCL_OK;
 		}
-
 
 		case CASS_VALUE_TYPE_VARINT: {
-			*tclObj = NULL;
-			return TCL_OK;
-		}
+			Tcl_ResetResult(interp);
+			Tcl_AppendResult(interp, "unsupported value type for get operation 'varint'", NULL);
 
-		case CASS_VALUE_TYPE_TIMEUUID: {
 			*tclObj = NULL;
-			return TCL_OK;
+			return TCL_ERROR;
 		}
 
 		case CASS_VALUE_TYPE_INET: {
 			CassError cassError;
 			CassInet cassInet;
+			char addrBuf[INET6_ADDRSTRLEN];
+			int isIpV6;
 
+			assert(INET6_ADDRSTRLEN >= INET_ADDRSTRLEN);
 			cassError = cass_value_get_inet (cassValue, &cassInet);
+
+			if (cassError != CASS_OK) {
+				return casstcl_cass_error_to_tcl (ct, cassError);
+			}
+
+			isIpV6 = (cassInet.address_length == CASS_INET_V6_LENGTH);
+			memset(addrBuf, 0, INET6_ADDRSTRLEN);
+			inet_ntop(isIpV6 ? AF_INET6 : AF_INET, cassInet.address, addrBuf, INET6_ADDRSTRLEN);
+
+			*tclObj = Tcl_NewStringObj(addrBuf, -1);
+			return TCL_OK;
 		}
 
 		case CASS_VALUE_TYPE_MAP: {
@@ -1680,6 +2105,10 @@ int casstcl_cass_value_to_tcl_obj (casstcl_sessionClientData *ct, const CassValu
 		}
 	}
 
+	sprintf(msg, "%X", valueType);
+	Tcl_ResetResult(interp);
+	Tcl_AppendResult(interp, "unrecognized value type for get operation 0x", msg, NULL);
+
 	*tclObj = NULL;
 	return TCL_ERROR;
 }
@@ -1724,7 +2153,12 @@ int casstcl_append_tcl_obj_to_collection (casstcl_sessionClientData *ct, CassCol
 			break;
 		}
 
-		case CASS_VALUE_TYPE_VARINT:
+		case CASS_VALUE_TYPE_VARINT: {
+			Tcl_ResetResult(interp);
+			Tcl_AppendResult(interp, "unsupported value type for append operation 'varint'", NULL);
+			return TCL_ERROR;
+		}
+
 		case CASS_VALUE_TYPE_BLOB: {
 			int length = 0;
 			unsigned char *value = Tcl_GetByteArrayFromObj (obj, &length);
@@ -1745,7 +2179,18 @@ int casstcl_append_tcl_obj_to_collection (casstcl_sessionClientData *ct, CassCol
 			break;
 		}
 
-		case CASS_VALUE_TYPE_TIMESTAMP:
+		case CASS_VALUE_TYPE_TIMESTAMP: {
+			Tcl_WideInt wideValue = 0;
+
+			if (casstcl_GetTimestampFromObj (interp, obj, &wideValue) == TCL_ERROR) {
+				Tcl_AppendResult (interp, " while converting 'timestamp' element", NULL);
+				return TCL_ERROR;
+			}
+
+			cassError = cass_collection_append_int64 (collection, wideValue);
+			break;
+		}
+
 		case CASS_VALUE_TYPE_BIGINT:
 		case CASS_VALUE_TYPE_COUNTER: {
 			Tcl_WideInt wideValue = 0;
@@ -1796,21 +2241,49 @@ int casstcl_append_tcl_obj_to_collection (casstcl_sessionClientData *ct, CassCol
 			break;
 		}
 
+		case CASS_VALUE_TYPE_TIMEUUID:
 		case CASS_VALUE_TYPE_UUID: {
-			break;
-		}
+			CassUuid cassUuid;
 
+			cassError = cass_uuid_from_string(Tcl_GetString(obj), &cassUuid);
 
-		case CASS_VALUE_TYPE_TIMEUUID: {
+			if (cassError == CASS_OK) {
+				cassError = cass_collection_append_uuid (collection, cassUuid);
+			}
 			break;
 		}
 
 		case CASS_VALUE_TYPE_INET: {
+			CassInet cassInet;
+			cass_uint8_t address[CASS_INET_V6_LENGTH];
+
+			if (casstcl_GetInetFromObj(interp, obj, &cassInet)) {
+				return TCL_ERROR;
+			}
+
+			memcpy(address, cassInet.address, CASS_INET_V6_LENGTH);
+
+			if (cassInet.address_length == CASS_INET_V6_LENGTH) {
+				cassInet = cass_inet_init_v6(address);
+			} else if (cassInet.address_length == CASS_INET_V4_LENGTH) {
+				cassInet = cass_inet_init_v4(address);
+			} else {
+				Tcl_ResetResult(interp);
+				Tcl_AppendResult(interp, "bad 'inet' address length for bind operation", NULL);
+				return TCL_ERROR;
+			}
+
+			cassError = cass_collection_append_inet (collection, cassInet);
 			break;
 		}
 
 		default: {
-			break;
+			char msg[60];
+
+			sprintf(msg, "%X", valueType);
+			Tcl_ResetResult(interp);
+			Tcl_AppendResult(interp, "unrecognized value type for append operation 0x", msg, NULL);
+			return TCL_ERROR;
 		}
 	}
 
@@ -1873,7 +2346,9 @@ int casstcl_bind_tcl_obj (casstcl_sessionClientData *ct, CassStatement *statemen
 		}
 
 		case CASS_VALUE_TYPE_UNKNOWN: {
-			break;
+			Tcl_ResetResult(interp);
+			Tcl_AppendResult(interp, "unsupported value type for bind operation 'unknown'", NULL);
+			return TCL_ERROR;
 		}
 
 		case CASS_VALUE_TYPE_CUSTOM: {
@@ -1922,7 +2397,22 @@ int casstcl_bind_tcl_obj (casstcl_sessionClientData *ct, CassStatement *statemen
 			break;
 		}
 
-		case CASS_VALUE_TYPE_TIMESTAMP:
+		case CASS_VALUE_TYPE_TIMESTAMP: {
+			Tcl_WideInt wideValue = 0;
+
+			if (casstcl_GetTimestampFromObj (interp, obj, &wideValue) == TCL_ERROR) {
+				Tcl_AppendResult (interp, " while converting 'timestamp' element", NULL);
+				return TCL_ERROR;
+			}
+
+			if (name == NULL) {
+				cassError = cass_statement_bind_int64 (statement, index, wideValue);
+			} else {
+				cassError = cass_statement_bind_int64_by_name (statement, name, wideValue);
+			}
+			break;
+		}
+
 		case CASS_VALUE_TYPE_BIGINT:
 		case CASS_VALUE_TYPE_COUNTER: {
 			Tcl_WideInt wideValue = 0;
@@ -1941,6 +2431,48 @@ int casstcl_bind_tcl_obj (casstcl_sessionClientData *ct, CassStatement *statemen
 		}
 
 		case CASS_VALUE_TYPE_DECIMAL: {
+			int listObjc;
+			Tcl_Obj **listObjv;
+			int scale;
+			mp_int mpVal;
+			CassBytes cassBytes;
+			CassDecimal cassDecimal;
+
+			if (Tcl_ListObjGetElements (interp, obj, &listObjc, &listObjv) == TCL_ERROR) {
+				Tcl_AppendResult (interp, " while getting decimal elements", NULL);
+				return TCL_ERROR;
+			}
+
+			if (listObjc != 2) {
+				Tcl_ResetResult(interp);
+				Tcl_AppendResult(interp, "decimal requires exactly two elements", NULL);
+				return TCL_ERROR;
+			}
+
+			if (Tcl_GetIntFromObj(interp, listObjv[0], &scale) != TCL_OK) {
+				Tcl_AppendResult (interp, " while converting decimal scale", NULL);
+				return TCL_ERROR;
+			}
+
+			if (Tcl_GetBignumFromObj(interp, listObjv[1], &mpVal) != TCL_OK) {
+				Tcl_AppendResult (interp, " while converting decimal bignum", NULL);
+				return TCL_ERROR;
+			}
+
+			if (casstcl_InitCassBytesFromBignum(interp, &cassBytes, &mpVal) != TCL_OK) {
+				Tcl_AppendResult (interp, " while creating decimal bytes", NULL);
+				return TCL_ERROR;
+			}
+
+			cassDecimal.scale = scale;
+			cassDecimal.varint = cassBytes;
+
+			if (name == NULL) {
+				cassError = cass_statement_bind_decimal (statement, index, cassDecimal);
+			} else {
+				cassError = cass_statement_bind_decimal_by_name (statement, name, cassDecimal);
+			}
+			ckfree(cassBytes.data);
 			break;
 		}
 
@@ -1992,19 +2524,40 @@ int casstcl_bind_tcl_obj (casstcl_sessionClientData *ct, CassStatement *statemen
 			break;
 		}
 
-		case CASS_VALUE_TYPE_UUID: {
+		case CASS_VALUE_TYPE_UUID:
+		case CASS_VALUE_TYPE_TIMEUUID: {
+			CassUuid cassUuid;
+
+			cassError = cass_uuid_from_string(Tcl_GetString(obj), &cassUuid);
+
+			if (cassError == CASS_OK) {
+				if (name == NULL) {
+					cassError = cass_statement_bind_uuid (statement, index, cassUuid);
+				} else {
+					cassError = cass_statement_bind_uuid_by_name (statement, name, cassUuid);
+				}
+			}
 			break;
 		}
 
 		case CASS_VALUE_TYPE_VARINT: {
-			break;
-		}
-
-		case CASS_VALUE_TYPE_TIMEUUID: {
-			break;
+			Tcl_ResetResult(interp);
+			Tcl_AppendResult(interp, "unsupported value type for bind operation 'varint'", NULL);
+			return TCL_ERROR;
 		}
 
 		case CASS_VALUE_TYPE_INET: {
+			CassInet cassInet;
+
+			if (casstcl_GetInetFromObj(interp, obj, &cassInet)) {
+				return TCL_ERROR;
+			}
+
+			if (name == NULL) {
+				cassError = cass_statement_bind_inet (statement, index, cassInet);
+			} else {
+				cassError = cass_statement_bind_inet_by_name (statement, name, cassInet);
+			}
 			break;
 		}
 
@@ -2081,6 +2634,14 @@ int casstcl_bind_tcl_obj (casstcl_sessionClientData *ct, CassStatement *statemen
 // printf("bound map collection of %d elements as to statement index %d\n", listObjc, index);
 
 			break;
+		}
+
+		default: {
+			char msg[60];
+			sprintf(msg, "%X", valueType);
+			Tcl_ResetResult(interp);
+			Tcl_AppendResult(interp, "unrecognized value type for bind operation 0x", msg, NULL);
+			return TCL_ERROR;
 		}
 	}
 
@@ -2495,7 +3056,7 @@ casstcl_bind_names_from_prepared (casstcl_preparedClientData *pcd, int objc, Tcl
 // printf ("tried to bind arg '%s' as type %d %d %d value '%s'\n", name, valueType, valueSubType1, valueSubType2, Tcl_GetString(valueObj));
 		if (tclReturn == TCL_ERROR) {
 //printf ("error from casstcl_bind_tcl_obj\n");
-			Tcl_AppendResult (interp, " while attempting to bind field name of '", name, "' of type '", Tcl_GetString (objv[i]), "' referencing table '", table, "'", NULL);
+			Tcl_AppendResult (interp, " while attempting to bind field name of '", name, "' of type '", casstcl_cass_value_type_to_string(valueType), "' referencing table '", table, "'", NULL);
 			masterReturn = TCL_ERROR;
 			break;
 		}
@@ -2700,7 +3261,7 @@ casstcl_make_upsert_statement (casstcl_sessionClientData *ct, char *tableName, T
  *----------------------------------------------------------------------
  */
 int
-casstcl_make_statement_from_objv (casstcl_sessionClientData *ct, int objc, Tcl_Obj *CONST objv[], CassStatement **statementPtr) {
+casstcl_make_statement_from_objv (casstcl_sessionClientData *ct, int objc, Tcl_Obj *CONST objv[], int argOffset, CassStatement **statementPtr) {
 	int arrayStyle = 0;
 	char *arrayName = NULL;
 	char *tableName = NULL;
@@ -2720,17 +3281,13 @@ casstcl_make_statement_from_objv (casstcl_sessionClientData *ct, int objc, Tcl_O
 		OPT_PREPARED
 	};
 
+	int newObjc = objc - argOffset;
+	Tcl_Obj *CONST *newObjv = objv + argOffset;
 	int optIndex;
 	int arg = 0;
 
-	if (objc < 1) {
-	  wrong_numargs:
-		Tcl_WrongNumArgs (interp, 2, objv, "?-array arrayName? ?-table tableName? ?-prepared prepared? ?query? ?arg...?");
-		return TCL_ERROR;
-	}
-
-	while (arg + 1 < objc) {
-		char *optionString = Tcl_GetString (objv[arg]);
+	while (arg < newObjc) {
+		char *optionString = Tcl_GetString (newObjv[arg]);
 
 		// if the first character isn't a dash, we're done here.
 		// this is going to get called a lot so i don't want
@@ -2742,49 +3299,67 @@ casstcl_make_statement_from_objv (casstcl_sessionClientData *ct, int objc, Tcl_O
 
 		// OK so we aren't going to accept anything starting with - that
 		// isn't in our option list
-		if (Tcl_GetIndexFromObj (interp, objv[arg++], options, "options",
+		if (Tcl_GetIndexFromObj (interp, newObjv[arg++], options, "options",
 			TCL_EXACT, &optIndex) != TCL_OK) {
 			return TCL_ERROR;
 		}
 
 		switch ((enum options) optIndex) {
 			case OPT_ARRAY: {
-				if (arg + 1 >= objc) {
+				if (arg >= newObjc) {
 					goto wrong_numargs;
 				}
 
-				arrayName = Tcl_GetString (objv[arg++]);
+				arrayName = Tcl_GetString (newObjv[arg++]);
 				arrayStyle = 1;
 				break;
 			}
 
 			case OPT_TABLE: {
-				if (arg + 1 >= objc) {
+				if (arg >= newObjc) {
 					goto wrong_numargs;
 				}
 
-				tableName = Tcl_GetString (objv[arg++]);
+				tableName = Tcl_GetString (newObjv[arg++]);
 				arrayStyle = 1;
 				break;
 			}
 
 			case OPT_PREPARED: {
-				if (arg + 1 >= objc) {
+				if (arg >= newObjc) {
 					goto wrong_numargs;
 				}
 
-				preparedName = Tcl_GetString (objv[arg++]);
+				preparedName = Tcl_GetString (newObjv[arg++]);
 // printf("saw prepared case, name = '%s'\n", preparedName);
 				break;
 			}
 		}
 	}
 
-//printf ("looking for query, arg %d, objc %d\n", arg, objc);
+//printf ("looking for query, arg %d, newObjc %d\n", arg, newObjc);
 
-	// there must at least be a query string or prepared arglist left
-	if (arg >= objc) {
-		goto wrong_numargs;
+	// There are several different possibilities here in terms of the list
+	// of arguments (i.e. the ones already processed and those that remain
+	// to be processed):
+	//
+	//     1. There are no arguments left.  This is fine if the query is
+	//        prepared (i.e. the -prepared option was processed).  This
+	//        means there are *NO* name/value pairs to bind.
+	//
+	//     2. There is exactly one argument left.  This is always fine.
+	//
+	//     3. There is more than one argument left.  This is fine if the
+	//        -prepared option was not processed; otherwise, this is an
+	//        error.
+	//
+	// This check is used to determine if we ran out of arguments without
+	// having processed the -prepared option.
+	//
+	if (arg >= newObjc && preparedName == NULL) {
+	  wrong_numargs:
+		Tcl_WrongNumArgs (interp, (argOffset <= 2) ? argOffset : 2, objv, "?-array arrayName? ?-table tableName? ?-prepared prepared? ?query? ?arg...?");
+		return TCL_ERROR;
 	}
 
 	if (preparedName != NULL && arrayStyle) {
@@ -2799,6 +3374,8 @@ casstcl_make_statement_from_objv (casstcl_sessionClientData *ct, int objc, Tcl_O
 
 		// locate the prepared statement structure we created earlier
 		casstcl_preparedClientData * pcd = casstcl_prepared_command_to_preparedClientData (ct, preparedName);
+		int listObjc = 0;
+		Tcl_Obj **listObjv = NULL;
 
 		if (pcd == NULL) {
 			Tcl_ResetResult (interp);
@@ -2806,25 +3383,32 @@ casstcl_make_statement_from_objv (casstcl_sessionClientData *ct, int objc, Tcl_O
 			return TCL_ERROR;
 		}
 
-		// split out the column_name-value pairs of names and values
-		int listObjc;
-		Tcl_Obj **listObjv;
-
-		if (Tcl_ListObjGetElements (interp, objv[arg++], &listObjc, &listObjv) == TCL_ERROR) {
-			Tcl_AppendResult (interp, " while parsing list of column-value pairs", NULL);
+		// there must be exactly one argument left.  the list of
+		// name/value pairs, which must contain an even number of
+		// elements.
+		if (arg < newObjc && arg + 1 != newObjc) {
+			Tcl_WrongNumArgs (interp, (argOffset <= 2) ? argOffset : 2, objv, "-prepared prepared ?list?");
 			return TCL_ERROR;
 		}
 
-		if (listObjc & 1) {
-			Tcl_ResetResult (interp);
-			Tcl_AppendResult (interp, "list must contain an even number of elements", NULL);
-			return TCL_ERROR;
+		if (arg < newObjc) {
+			// split out the column_name-value pairs of names and values
+			if (Tcl_ListObjGetElements (interp, newObjv[arg++], &listObjc, &listObjv) == TCL_ERROR) {
+				Tcl_AppendResult (interp, " while parsing list of column-value pairs", NULL);
+				return TCL_ERROR;
+			}
+
+			if (listObjc & 1) {
+				Tcl_ResetResult (interp);
+				Tcl_AppendResult (interp, "list must contain an even number of elements", NULL);
+				return TCL_ERROR;
+			}
 		}
 		return casstcl_bind_names_from_prepared (pcd, listObjc, listObjv, statementPtr);
 	}
 
-	char *query = Tcl_GetString (objv[arg++]);
-	// (whatever is left of the objv from arg to the end are column-related)
+	char *query = Tcl_GetString (newObjv[arg++]);
+	// (whatever is left of the newObjv from arg to the end are column-related)
 
 	if (arrayStyle) {
 		if (tableName == NULL) {
@@ -2839,9 +3423,9 @@ casstcl_make_statement_from_objv (casstcl_sessionClientData *ct, int objc, Tcl_O
 			return TCL_ERROR;
 		}
 
-		return casstcl_bind_names_from_array (ct, tableName, query, arrayName, objc - arg, &objv[arg], statementPtr);
+		return casstcl_bind_names_from_array (ct, tableName, query, arrayName, newObjc - arg, &newObjv[arg], statementPtr);
 	} else {
-		return casstcl_bind_values_and_types (ct, query, objc - arg, &objv[arg], statementPtr);
+		return casstcl_bind_values_and_types (ct, query, newObjc - arg, &newObjv[arg], statementPtr);
 	}
 }
 
@@ -3346,7 +3930,7 @@ casstcl_batchObjectObjCmd(ClientData cData, Tcl_Interp *interp, int objc, Tcl_Ob
     switch ((enum options) optIndex) {
 		case OPT_ADD: {
 			CassStatement* statement = NULL;
-			if (casstcl_make_statement_from_objv (bcd->ct, objc - 2, &objv[2], &statement) == TCL_ERROR) {
+			if (casstcl_make_statement_from_objv (bcd->ct, objc, objv, 2, &statement) == TCL_ERROR) {
 				return TCL_ERROR;
 			}
 
@@ -3708,8 +4292,15 @@ int
 casstcl_createFutureObjectCommand (casstcl_sessionClientData *ct, CassFuture *future, Tcl_Obj *callbackObj)
 {
     // allocate one of our cass future objects for Tcl and configure it
-	casstcl_futureClientData *fcd = (casstcl_futureClientData *)ckalloc (sizeof (casstcl_futureClientData));
+	casstcl_futureClientData *fcd;
 
+	CassError rc = cass_future_error_code (future);
+	if (rc != CASS_OK) {
+		cass_future_free (future);
+		return casstcl_cass_error_to_tcl (ct, rc);
+	}
+
+    fcd = (casstcl_futureClientData *)ckalloc (sizeof (casstcl_futureClientData));
     fcd->cass_future_magic = CASS_FUTURE_MAGIC;
 	fcd->ct = ct;
 	fcd->future = future;
@@ -3924,7 +4515,7 @@ casstcl_cassObjectObjCmd(ClientData cData, Tcl_Interp *interp, int objc, Tcl_Obj
 				// stop as soon as you don't match something, leaving arg
 				// at the not-matched thing (i.e. don't use arg++ in
 				// this statement)
-				if (Tcl_GetIndexFromObj (interp, objv[arg], subOptions, "subOption", TCL_EXACT, &subOptIndex) != TCL_OK) {
+				if (Tcl_GetIndexFromObj (NULL, objv[arg], subOptions, "subOption", TCL_EXACT, &subOptIndex) != TCL_OK) {
 					break;
 				}
 				arg++;
@@ -3963,7 +4554,7 @@ casstcl_cassObjectObjCmd(ClientData cData, Tcl_Interp *interp, int objc, Tcl_Obj
 			} else {
 				// it's a statement, possibly with arguments
 
-				if (casstcl_make_statement_from_objv (ct, objc - arg, &objv[arg], &statement) == TCL_ERROR) {
+				if (casstcl_make_statement_from_objv (ct, objc, objv, arg, &statement) == TCL_ERROR) {
 					return TCL_ERROR;
 				}
 
@@ -4136,7 +4727,9 @@ casstcl_cassObjectObjCmd(ClientData cData, Tcl_Interp *interp, int objc, Tcl_Obj
 			}
 
 			resultCode = casstcl_list_keyspaces (ct, &obj);
-			Tcl_SetObjResult (ct->interp, obj);
+			if (obj != NULL) {
+				Tcl_SetObjResult (ct->interp, obj);
+			}
 			break;
 		}
 
@@ -4150,7 +4743,9 @@ casstcl_cassObjectObjCmd(ClientData cData, Tcl_Interp *interp, int objc, Tcl_Obj
 			char *keyspace = Tcl_GetString (objv[2]);
 
 			resultCode = casstcl_list_tables (ct, keyspace, &obj);
-			Tcl_SetObjResult (ct->interp, obj);
+			if (obj != NULL) {
+				Tcl_SetObjResult (ct->interp, obj);
+			}
 			break;
 		}
 
@@ -4166,7 +4761,9 @@ casstcl_cassObjectObjCmd(ClientData cData, Tcl_Interp *interp, int objc, Tcl_Obj
 			char *table = Tcl_GetString (objv[3]);
 
 			resultCode = casstcl_list_columns (ct, keyspace, table, (optIndex == OPT_LIST_COLUMN_TYPES), &obj);
-			Tcl_SetObjResult (ct->interp, obj);
+			if (obj != NULL) {
+				Tcl_SetObjResult (ct->interp, obj);
+			}
 			break;
 		}
 
@@ -4177,6 +4774,7 @@ casstcl_cassObjectObjCmd(ClientData cData, Tcl_Interp *interp, int objc, Tcl_Obj
 			}
 
 			resultCode = casstcl_reimport_column_type_map (ct);
+			break;
 		}
 
 		case OPT_CONTACT_POINTS: {
@@ -4620,12 +5218,14 @@ casstcl_cassObjCmd(ClientData clientData, Tcl_Interp *interp, int objc, Tcl_Obj 
     static CONST char *options[] = {
         "create",
         "logging_callback",
+        "log_level",
         NULL
     };
 
     enum options {
         OPT_CREATE,
-		OPT_LOGGING_CALLBACK
+		OPT_LOGGING_CALLBACK,
+		OPT_LOG_LEVEL
     };
 
     // basic command line processing
@@ -4696,6 +5296,7 @@ casstcl_cassObjCmd(ClientData clientData, Tcl_Interp *interp, int objc, Tcl_Obj 
 			// deleted
 			if (casstcl_loggingCallbackObj != NULL) {
 				Tcl_DecrRefCount (casstcl_loggingCallbackObj);
+				casstcl_loggingCallbackObj = NULL;
 			}
 
 			casstcl_loggingCallbackObj = objv[2];
@@ -4704,6 +5305,21 @@ casstcl_cassObjCmd(ClientData clientData, Tcl_Interp *interp, int objc, Tcl_Obj 
 			casstcl_loggingCallbackThreadId = Tcl_GetCurrentThread();
 
 			cass_log_set_callback (casstcl_logging_callback, interp);
+			break;
+		}
+		case OPT_LOG_LEVEL: {
+			CassLogLevel cassLogLevel;
+
+			if (objc != 3) {
+				Tcl_WrongNumArgs (interp, 2, objv, "level");
+				return TCL_ERROR;
+			}
+
+			if (casstcl_obj_to_cass_log_level(interp, objv[2], &cassLogLevel) == TCL_OK) {
+				cass_log_set_level(cassLogLevel);
+			} else {
+				return TCL_ERROR;
+			}
 			break;
 		}
 	}

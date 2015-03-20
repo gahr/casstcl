@@ -357,6 +357,16 @@ When a log message callback occurs from the Cassandra cpp-driver, casstcl will o
 
 * "message" and the error message itself
 
+The level of detail queued to the logging callback may be adjusted via:
+
+```tcl
+::casstcl::cass log_level level
+```
+
+This sets the log level for the cpp-driver.  The legal values, in order from least output (none) to most output (all) are "disabled", "critical", "error", "warn", "info", "debug", and "trace".
+
+The default is "warn".
+
 A sample implementation:
 
 ```tcl
@@ -368,6 +378,7 @@ proc logging_callback {pairList} {
 }
 
 casstcl::cass logging_callback logging_callback
+casstcl::cass log_level info
 ```
 
 According to the cpp-driver documentation, logging configuration should be done before calling any other driver function, so if you're going to use this, invoke it after package requiring casstcl and before invoking ::casstcl::cass create.
@@ -401,6 +412,26 @@ Return a quote of the specified value according to the specified cassandra type.
 * **casstcl::quote_typeof** *table.columnName* *value* *?subType?*
 
 Quote the value according to the field *columnName* in table *table*.  *subType* can be **key** for collection sets and lists and can be **key** or **value** for collection maps.  For these usages it returns the corresponding data type.  If the subType is specified and the column is a collection you get a list back like *list text* and *map int text*.
+
+* **casstcl::assemble_statement** *statementVar* *line*
+
+Given the name of a variable (initially set to an empty string) to contain a CQL statement, and a line containing possibly a statement or part of a statement, append the line to the statement and return 1 if a complete statement is present, else 0.
+
+Comments and blank lines are skipped.
+
+(The check for a complete statement is the mere presence of a semicolon anywhere on the line, which is kind of meatball.)
+
+* **run_fp** *cassdb* *fp*
+
+Read from a file pointer and execute complete commands through the specified cassandra object.
+
+* **run_file** *cassdb* *fileName*
+
+Run CQL commands from a file.
+
+* **interact** *cassdb*
+
+Enter a primitive cqlsh-like shell.  Provides a prompt of *tcqlsh>* when no partial command has been entered or *......>* when a partial command is present.  Once a semicolon is seen via one input line or multiple, the command is executed.  "exit" to exit the interact proc.
 
 Bugs
 ---
