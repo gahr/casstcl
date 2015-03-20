@@ -4131,7 +4131,7 @@ casstcl_import_from_pg_select (casstcl_sessionClientData *ct, char *tableName, i
 					//
 					// it is up to the callout routine to dispose of the batch
 					//
-					if (bcd->count++ >= batchSize) {
+					if (++bcd->count >= batchSize) {
 						tclReturn = casstcl_invoke_callback_with_argument (interp, calloutObj, batchObj);
 
 						if (tclReturn == TCL_ERROR) {
