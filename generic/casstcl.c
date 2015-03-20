@@ -3430,17 +3430,18 @@ casstcl_make_statement_from_objv (casstcl_sessionClientData *ct, int objc, Tcl_O
 }
 
 int
-casstcl_select_from_pg (casstcl_sessionClientData *ct, char *tableName, char *batchObjName, Tcl_Obj *connObj, char *queryString, Tcl_Obj *varNameObj)
+casstcl_select_from_pg (casstcl_sessionClientData *ct, char *tableName, int batchSize, Tcl_Obj *calloutObj, Tcl_Obj *connObj, char *queryString)
 {
 	Tcl_Interp *interp = ct->interp;
 	Pgh_ConnectionId *connid;
 	PGconn *conn;
 	char *connString = Tcl_GetString (connObj);
 	PGresult *result;
-	int firstPass = 1;
 	int ncols;
 	casstcl_batchClientData *bcd = casstcl_batch_command_to_batchClientData (ct, batchObjName);
-
+	int tclReturn = TCL_OK;
+	Tcl_Obj **columnNameObjs = NULL;
+	int nRowsReturned = 0;
 
 	conn = PgGetConnectionId (interp, connString, &connid);
 	if (conn == NULL) {
@@ -3456,6 +3457,8 @@ casstcl_select_from_pg (casstcl_sessionClientData *ct, char *tableName, char *ba
 
 	while ((result = PQgetResult (conn)) != NULL) {
 		int resultStatus = PQresultStatus (result);
+		int tupno;
+		int column;
 
 		if (resultStatus != PGRES_TUPLES_OK && resultStatus != PGRES_SINGLE_TUPLE) {
 			char *errString = PQresultErrorMessage (result);
@@ -3468,11 +3471,11 @@ casstcl_select_from_pg (casstcl_sessionClientData *ct, char *tableName, char *ba
 		}
 
 		// on the first pass squirrel off the column names
-		if (firstPass) {
+		if (nRowsReturned++ == 0) {
 			ncols = PQnfields (result);
 			int column;
 
-			Tcl_Obj **columnNameObjs = (Tcl_Obj **)ckalloc (sizeof (Tcl_Obj *) * ncols);
+			columnNameObjs = (Tcl_Obj **)ckalloc (sizeof (Tcl_Obj *) * ncols);
 
 			for (column = 0; column < ncols; column++) {
 				columnNameObjs[column] = Tcl_NewStringObj (PQfname (result, column), -1);
@@ -3481,13 +3484,13 @@ casstcl_select_from_pg (casstcl_sessionClientData *ct, char *tableName, char *ba
 			firstPass = 0;
 		}
 
-		tclReturn = TCL_OK;
-
+		// handle result, since we are doing single row mode then the outer
+		// loop is likely to run many times and, thus, this...
+		//
 		for (tupno = 0; tupno < PQntuples (result); tupno++) {
 			Tcl_Obj *listObj = Tcl_NewObj ();
 
 			for (column = 0; column < ncols; column++) {
-				Tcl_Obj *valueObj = NULL;
 				char *string;
 
 				if (PQgetisnull (result, tupno, column)) {
@@ -3496,12 +3499,12 @@ casstcl_select_from_pg (casstcl_sessionClientData *ct, char *tableName, char *ba
 
 				string = PQgetvalue (result, tupno, column);
 
-				if (Tcl_ListObjAppendELement (interp, listObj, columnNameObjs[column]) == TCL_ERROR) {
+				if (Tcl_ListObjAppendElement (interp, listObj, columnNameObjs[column]) == TCL_ERROR) {
 					Tcl_AppendResult (interp, " while appending field name '", Tcl_GetString (columnNameObjs[column]), "'", NULL);
 					return TCL_ERROR;
 				}
 
-				if (Tcl_ListObjAppendELement (interp, listObj, string) == TCL_ERROR) {
+				if (Tcl_ListObjAppendElement (interp, listObj, string) == TCL_ERROR) {
 					Tcl_AppendResult (interp, " while appending field value '", string, "'", NULL);
 					return TCL_ERROR;
 				}
@@ -3516,7 +3519,7 @@ casstcl_select_from_pg (casstcl_sessionClientData *ct, char *tableName, char *ba
 
 				if (cassError == CASS_OK) {
 					if (bcd->count++ >= batchSize) {
-						tclReturnCode = casstcl_invoke_callback_with_argument (interp, callbackObj, futureObj);
+						tclReturn = casstcl_invoke_callback_with_argument (interp, callbackObj, futureObj);
 					}
 				} else {
 					return casstcl_cass_error_to_tcl (bcd->ct, cassError);
